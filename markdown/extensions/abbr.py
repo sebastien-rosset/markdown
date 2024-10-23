@@ -13,23 +13,16 @@
 
 # License: [BSD](https://opensource.org/licenses/bsd-license.php)
 
-"""
-This extension adds abbreviation handling to Python-Markdown.
-
-See the [documentation](https://Python-Markdown.github.io/extensions/abbreviations)
-for details.
-"""
-
 from __future__ import annotations
 
 from . import Extension
 from ..blockprocessors import BlockProcessor
-from ..inlinepatterns import InlineProcessor
 from ..treeprocessors import Treeprocessor
-from ..util import AtomicString, deprecated
-from typing import TYPE_CHECKING
+from ..util import AtomicString
+from typing import TYPE_CHECKING, Optional
 import re
 import xml.etree.ElementTree as etree
+from functools import lru_cache
 
 if TYPE_CHECKING:  # pragma: no cover
     from .. import Markdown
@@ -37,152 +30,297 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 class AbbrExtension(Extension):
-    """ Abbreviation Extension for Python-Markdown. """
+    """
+    Abbreviation Extension for Python-Markdown.
+
+    This extension implements abbreviations in Python-Markdown. It adds the ability
+    to define abbreviations in the document and automatically wrap them in <abbr>
+    tags with corresponding title attributes.
+    """
 
     def __init__(self, **kwargs):
-        """ Initiate Extension and set up configs. """
+        """
+        Initialize the extension with optional configuration.
+
+        Args:
+            **kwargs: Configuration options for the extension
+                     - glossary: A dictionary of abbreviations and their definitions
+        """
         self.config = {
-            'glossary': [
+            "glossary": [
                 {},
-                'A dictionary where the `key` is the abbreviation and the `value` is the definition.'
-                "Default: `{}`"
+                "A dictionary where the `key` is the abbreviation and the `value` is the definition. "
+                "Default: `{}`",
             ],
         }
-        """ Default configuration options. """
         super().__init__(**kwargs)
-        self.abbrs = {}
-        self.glossary = {}
+        self.abbrs = {}  # Current abbreviations
+        self.glossary = {}  # Persistent glossary abbreviations
 
     def reset(self):
-        """ Clear all previously defined abbreviations. """
+        """
+        Clear all previously defined abbreviations and restore glossary items.
+        Called before each new document is processed.
+        """
         self.abbrs.clear()
-        if (self.glossary):
+        if self.glossary:
             self.abbrs.update(self.glossary)
 
     def reset_glossary(self):
-        """ Clear all abbreviations from the glossary. """
+        """Clear all abbreviations from the glossary."""
         self.glossary.clear()
 
     def load_glossary(self, dictionary: dict[str, str]):
-        """Adds `dictionary` to our glossary. Any abbreviations that already exist will be overwritten."""
+        """
+        Add abbreviations to the glossary.
+
+        Args:
+            dictionary: A dictionary of abbreviations where keys are terms and values are definitions.
+                      New entries will override existing ones with the same key.
+        """
         if dictionary:
             self.glossary = {**dictionary, **self.glossary}
 
     def extendMarkdown(self, md):
-        """ Insert `AbbrTreeprocessor` and `AbbrBlockprocessor`. """
-        if (self.config['glossary'][0]):
-            self.load_glossary(self.config['glossary'][0])
+        """
+        Register the required processors with Python-Markdown.
+
+        Args:
+            md: The Markdown instance to extend.
+        """
+        if self.config["glossary"][0]:
+            self.load_glossary(self.config["glossary"][0])
         self.abbrs.update(self.glossary)
         md.registerExtension(self)
-        md.treeprocessors.register(AbbrTreeprocessor(md, self.abbrs), 'abbr', 7)
-        md.parser.blockprocessors.register(AbbrBlockprocessor(md.parser, self.abbrs), 'abbr', 16)
+        md.treeprocessors.register(AbbrTreeprocessor(md, self.abbrs), "abbr", 7)
+        md.parser.blockprocessors.register(
+            AbbrBlockprocessor(md.parser, self.abbrs), "abbr", 16
+        )
 
 
 class AbbrTreeprocessor(Treeprocessor):
-    """ Replace abbreviation text with `<abbr>` elements. """
+    """
+    Replace abbreviation text with `<abbr>` elements.
+
+    This processor searches through the document tree for text matching defined
+    abbreviations and wraps them in <abbr> elements with appropriate titles.
+    The implementation is optimized for performance through regex caching and
+    efficient text processing.
+    """
 
     def __init__(self, md: Markdown | None = None, abbrs: dict | None = None):
+        """
+        Initialize the tree processor.
+
+        Args:
+            md: The Markdown instance (optional)
+            abbrs: Dictionary of abbreviations where keys are terms and values are definitions
+        """
         self.abbrs: dict = abbrs if abbrs is not None else {}
-        self.RE: re.RegexObject | None = None
+        self._pattern: Optional[str] = None  # Cached regex pattern string
+        self._regex_cache: dict[str, re.Pattern] = (
+            {}
+        )  # Cache for compiled regex patterns
         super().__init__(md)
 
+    @property
+    def pattern(self) -> str:
+        """
+        Lazily build and cache the regex pattern for matching abbreviations.
+
+        The pattern is built only when needed and cached for reuse. Abbreviations
+        are sorted by length (longest first) to ensure proper matching of overlapping terms.
+
+        Returns:
+            str: A regex pattern that matches any of the defined abbreviations
+        """
+        if self._pattern is None and self.abbrs:
+            # Sort by length (longest first) to handle overlapping matches correctly
+            abbr_list = sorted(self.abbrs.keys(), key=len, reverse=True)
+            # Create pattern that matches whole words only using word boundaries
+            self._pattern = f"\\b(?:{'|'.join(re.escape(key) for key in abbr_list)})\\b"
+        return (
+            self._pattern or r"(?!)"
+        )  # Return non-matching pattern if no abbreviations
+
+    @lru_cache(maxsize=1024)
+    def get_regex(self, pattern: str) -> re.Pattern:
+        """
+        Get or compile a cached regex pattern.
+
+        Args:
+            pattern: The regex pattern string
+
+        Returns:
+            re.Pattern: A compiled regex pattern object
+        """
+        return re.compile(pattern)
+
     def create_element(self, title: str, text: str, tail: str) -> etree.Element:
-        ''' Create an `abbr` element. '''
-        abbr = etree.Element('abbr', {'title': title})
-        abbr.text = AtomicString(text)
+        """
+        Create an `abbr` element with the given attributes.
+
+        Args:
+            title: The expansion/definition of the abbreviation
+            text: The abbreviation text itself
+            tail: Any text that follows the abbreviation
+
+        Returns:
+            etree.Element: A new abbr element
+        """
+        abbr = etree.Element("abbr", {"title": title})
+        abbr.text = AtomicString(
+            text
+        )  # Prevent further processing of abbreviation text
         abbr.tail = tail
         return abbr
 
-    def iter_element(self, el: etree.Element, parent: etree.Element | None = None) -> None:
-        ''' Recursively iterate over elements, run regex on text and wrap matches in `abbr` tags. '''
+    def process_text(self, text: str, matches: list) -> str:
+        """
+        Find all abbreviation matches in the given text.
+
+        This method performs a single pass over the text to find all matches,
+        collecting them for later processing to minimize string operations.
+
+        Args:
+            text: The text to process
+            matches: List to collect match information (start, end, text, title)
+
+        Returns:
+            str: The original text (unchanged in this method)
+        """
+        if not text:
+            return text
+
+        regex = self.get_regex(self.pattern)
+        for m in regex.finditer(text):
+            if self.abbrs[m.group(0)]:
+                matches.append((m.start(), m.end(), m.group(0), self.abbrs[m.group(0)]))
+        return text
+
+    def process_element_text(
+        self, el: etree.Element, parent: Optional[etree.Element] = None
+    ) -> None:
+        """
+        Process text content of an element and its children recursively.
+
+        This method handles both the element's own text and the tail text of its children.
+        Matches are processed in reverse order to maintain correct string indices.
+
+        Args:
+            el: The element to process
+            parent: The parent element (needed for processing tail text)
+        """
+        # Process children first (in reverse order to maintain indices)
         for child in reversed(el):
-            self.iter_element(child, el)
-        if text := el.text:
-            for m in reversed(list(self.RE.finditer(text))):
-                if self.abbrs[m.group(0)]:
-                    abbr = self.create_element(self.abbrs[m.group(0)], m.group(0), text[m.end():])
-                    el.insert(0, abbr)
-                    text = text[:m.start()]
-            el.text = text
+            self.process_element_text(child, el)
+
+        # Process element's own text
+        if el.text:
+            matches = []
+            el.text = self.process_text(el.text, matches)
+            # Insert abbreviation elements in reverse order
+            for start, end, text, title in reversed(matches):
+                abbr = self.create_element(title, text, el.text[end:])
+                el.insert(0, abbr)
+                el.text = el.text[:start]
+
+        # Process tail text if element has a parent
         if parent is not None and el.tail:
-            tail = el.tail
-            index = list(parent).index(el) + 1
-            for m in reversed(list(self.RE.finditer(tail))):
-                abbr = self.create_element(self.abbrs[m.group(0)], m.group(0), tail[m.end():])
-                parent.insert(index, abbr)
-                tail = tail[:m.start()]
-            el.tail = tail
+            matches = []
+            el.tail = self.process_text(el.tail, matches)
+            # Insert abbreviation elements after the current element
+            idx = list(parent).index(el) + 1
+            for start, end, text, title in reversed(matches):
+                abbr = self.create_element(title, text, el.tail[end:])
+                parent.insert(idx, abbr)
+                el.tail = el.tail[:start]
 
     def run(self, root: etree.Element) -> etree.Element | None:
-        ''' Step through tree to find known abbreviations. '''
+        """
+        Process the document tree for abbreviations.
+
+        This is the main entry point called by the Markdown processor.
+
+        Args:
+            root: The root element of the document tree
+
+        Returns:
+            None: The tree is modified in place
+        """
         if not self.abbrs:
-            # No abbreviations defined. Skip running processor.
-            return
-        # Build and compile regex
-        abbr_list = list(self.abbrs.keys())
-        abbr_list.sort(key=len, reverse=True)
-        self.RE = re.compile(f"\\b(?:{ '|'.join(re.escape(key) for key in abbr_list) })\\b")
-        # Step through tree and modify on matches
-        self.iter_element(root)
+            return None
+
+        self.process_element_text(root)
+        return None
 
 
 class AbbrBlockprocessor(BlockProcessor):
-    """ Parse text for abbreviation references. """
+    """
+    Parse text for abbreviation references.
 
-    RE = re.compile(r'^[*]\[(?P<abbr>[^\\]*?)\][ ]?:[ ]*\n?[ ]*(?P<title>.*)$', re.MULTILINE)
+    This processor handles the syntax for defining abbreviations in the document:
+    *[abbr]: definition
+    """
+
+    RE = re.compile(
+        r"^[*]\[(?P<abbr>[^\\]*?)\][ ]?:[ ]*\n?[ ]*(?P<title>.*)$", re.MULTILINE
+    )
 
     def __init__(self, parser: BlockParser, abbrs: dict):
+        """
+        Initialize the block processor.
+
+        Args:
+            parser: The block parser instance
+            abbrs: Dictionary to store discovered abbreviations
+        """
         self.abbrs: dict = abbrs
         super().__init__(parser)
 
     def test(self, parent: etree.Element, block: str) -> bool:
+        """
+        Test if the block should be processed.
+
+        Returns:
+            bool: Always returns True as we need to check all blocks for abbreviation definitions
+        """
         return True
 
     def run(self, parent: etree.Element, blocks: list[str]) -> bool:
         """
-        Find and remove all abbreviation references from the text.
-        Each reference is added to the abbreviation collection.
+        Process the given block for abbreviation definitions.
 
+        Args:
+            parent: Parent element
+            blocks: List of blocks to process
+
+        Returns:
+            bool: True if a definition was found and processed
         """
         block = blocks.pop(0)
         m = self.RE.search(block)
         if m:
-            abbr = m.group('abbr').strip()
-            title = m.group('title').strip()
+            abbr = m.group("abbr").strip()
+            title = m.group("title").strip()
             if title and abbr:
                 if title == "''" or title == '""':
+                    # Empty title removes abbreviation
                     self.abbrs.pop(abbr)
                 else:
+                    # Add or update abbreviation
                     self.abbrs[abbr] = title
-                if block[m.end():].strip():
-                    # Add any content after match back to blocks as separate block
-                    blocks.insert(0, block[m.end():].lstrip('\n'))
-                if block[:m.start()].strip():
-                    # Add any content before match back to blocks as separate block
-                    blocks.insert(0, block[:m.start()].rstrip('\n'))
+                if block[m.end() :].strip():
+                    # Add remaining content back to blocks
+                    blocks.insert(0, block[m.end() :].lstrip("\n"))
+                if block[: m.start()].strip():
+                    # Add preceding content back to blocks
+                    blocks.insert(0, block[: m.start()].rstrip("\n"))
                 return True
-        # No match. Restore block.
-        blocks.insert(0, block)
+        blocks.insert(0, block)  # No match found, restore block
         return False
 
 
-AbbrPreprocessor = deprecated("This class has been renamed to `AbbrBlockprocessor`.")(AbbrBlockprocessor)
-
-
-@deprecated("This class will be removed in the future; use `AbbrTreeprocessor` instead.")
-class AbbrInlineProcessor(InlineProcessor):
-    """ Abbreviation inline pattern. """
-
-    def __init__(self, pattern: str, title: str):
-        super().__init__(pattern)
-        self.title = title
-
-    def handleMatch(self, m: re.Match[str], data: str) -> tuple[etree.Element, int, int]:
-        abbr = etree.Element('abbr')
-        abbr.text = AtomicString(m.group('abbr'))
-        abbr.set('title', self.title)
-        return abbr, m.start(0), m.end(0)
-
-
 def makeExtension(**kwargs):  # pragma: no cover
+    """Create an instance of AbbrExtension with the given config options."""
     return AbbrExtension(**kwargs)
